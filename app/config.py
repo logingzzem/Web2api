@@ -16,13 +16,19 @@ class Settings(BaseSettings):
 
     # 会员网站 URL
     login_url: str = Field(default="https://example.com/login", description="登录页 URL")
-    form_url: str = Field(default="https://example.com/form/upload", description="表单上传页 URL")
+    landing_url: str = Field(
+        default="https://example.com/",
+        description="登录后的落地页 URL（从这里开始点击导航按钮）",
+    )
+    form_url: str = Field(
+        default="", description="直接访问的表单页 URL（留空则走 navigation_steps）"
+    )
 
     # 登录账号
     member_username: str = Field(default="", description="会员账号")
     member_password: str = Field(default="", description="会员密码")
 
-    # 登录表单字段选择器（默认常见选择器）
+    # 登录表单字段选择器（默认常见选择器，多个值用英文逗号分隔，按顺序尝试）
     username_selector: str = Field(
         default="input[name='username'],#username,input[type='text']",
         description="用户名输入框选择器",
@@ -36,9 +42,28 @@ class Settings(BaseSettings):
         description="登录按钮选择器",
     )
 
-    # 提交按钮选择器
+    # ---- 新增：登录后的导航步骤 ----
+    # 用英文逗号分隔的按钮文字列表，Agent 会按顺序查找并点击
+    # 例如："会员管理,添加,新增"  →  先找"会员管理"并点击，再找"添加"并点击
+    navigation_steps: str = Field(
+        default="",
+        description="登录后到表单前需依次点击的按钮文字（逗号分隔，如：会员管理,添加,新增）",
+    )
+
+    # 提交按钮候选文字（逗号分隔，多候选，按顺序尝试）
+    submit_button_texts: str = Field(
+        default="提交,保存,确认,Submit,Save,Confirm",
+        description="提交按钮候选文字（逗号分隔，找不到 CSS 选择器时按文字查找）",
+    )
+
+    # 提交按钮 CSS 选择器（逗号分隔，优先顺序）
     submit_button_selector: str = Field(
         default="button[type='submit'],input[type='submit']", description="表单提交按钮选择器"
+    )
+
+    # 表单加载完成的标志（等待该元素可见才算表单打开）
+    form_ready_selector: str = Field(
+        default="", description="表单加载完成标志选择器（如 .modal-dialog，留空则不等待）"
     )
 
     # 浏览器配置
@@ -71,6 +96,30 @@ class Settings(BaseSettings):
                 api_field = key[len("FORM_FIELD_") :].lower()
                 result[api_field] = value
         return result
+
+    def get_navigation_steps(self) -> list[str]:
+        """解析 navigation_steps 为有序列表（忽略空项与空格）。"""
+        if not self.navigation_steps:
+            return []
+        steps = [s.strip() for s in self.navigation_steps.split(",") if s.strip()]
+        return steps
+
+    def get_submit_button_texts(self) -> list[str]:
+        """解析提交按钮候选文字为列表。"""
+        if not self.submit_button_texts:
+            return []
+        return [s.strip() for s in self.submit_button_texts.split(",") if s.strip()]
+
+    def use_navigation_mode(self) -> bool:
+        """判断是否启用『点击导航按钮』模式（非直接 goto form_url）。"""
+        return bool(self.get_navigation_steps())
+
+    @staticmethod
+    def split_selectors(raw: str) -> list[str]:
+        """把逗号分隔的多个选择器拆成列表。"""
+        if not raw:
+            return []
+        return [s.strip() for s in raw.split(",") if s.strip()]
 
 
 @lru_cache
