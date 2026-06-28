@@ -77,19 +77,14 @@ CONFIG = {
     # -------- 额外表单字段 --------
     "extra_fields": {"keeplogin": "1"},
 
-    # -------- 验证码长度（用于筛选 OCR 结果）--------
-    "captcha_length": 4,
-
-    # -------- 登录成功判断 --------
-    # 1. 页面标题或 body 包含的关键词
-    "success_keywords": ["登录成功", "欢迎", "dashboard", "退出"],
-    # 2. 成功时页面标题（如果登录后跳转，标题会变化）
-    "success_title_regex": r"成功",
-
     # -------- 重试设置 --------
     "max_retries": 20,
     "retry_delay": 1,
     "timeout": 30,
+
+    # -------- 登录成功判断 --------
+    "success_keywords": ["登录成功", "欢迎", "dashboard", "退出"],
+    "success_title_regex": r"成功",
 }
 
 
@@ -131,78 +126,73 @@ class LoginBot:
     # OCR 识别验证码
     # --------------------------------------------------
     def recognize_captcha(self, img: Image.Image) -> str:
-        """识别验证码，尝试多种长度，优先选高置信度的"""
+        """识别验证码，多种策略产出候选，优先选4位结果"""
         import cv2
         import numpy as np
 
-        cfg = self.config
         ocr = _get_ocr()
         tmp_path = "/tmp/_captcha.png"
-        candidates = []
+        segments = []  # 单个片段: (text, score)
+        combined = []  # 同策略合并: (combined_text, avg_score)
 
-        # 尝试的验证码长度（该网站可能返回 4~8 位）
-        target_lens = list(range(4, 9))
+        def run_strategy(cv_img, name):
+            Image.fromarray(cv_img).save(tmp_path)
+            result = ocr.predict(tmp_path)
+            if not result or not isinstance(result, list) or len(result) == 0:
+                return
+            texts = result[0].get("rec_texts", [])
+            scores = result[0].get("rec_scores", [])
+            # 按检测顺序合并成一条
+            if texts:
+                merged = "".join(texts)
+                clean = "".join(c for c in merged if c.isalnum())
+                if clean:
+                    combined.append((clean, sum(scores) / len(scores)))
+            # 每条作为独立片段
+            for t, s in zip(texts, scores):
+                clean = "".join(c for c in t if c.isalnum())
+                if clean and s >= 0.3:
+                    segments.append((clean, s))
 
-        # 策略1: 原始图片
-        img.save(tmp_path)
-        result = ocr.predict(tmp_path)
-        candidates.extend(self._extract_results(result))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
 
-        # 策略2: 中值滤波 + CLAHE + OTSU 二值化
-        processed = self.preprocess_captcha(img)
-        processed.save(tmp_path)
-        result2 = ocr.predict(tmp_path)
-        candidates.extend(self._extract_results(result2))
-
-        # 策略3: 高对比度二值化（固定阈值 127）
+        # 策略1: 中值滤波 + CLAHE + OTSU
         cv_img = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
         cv_img = cv2.medianBlur(cv_img, 3)
-        _, binary = cv2.threshold(cv_img, 127, 255, cv2.THRESH_BINARY)
-        Image.fromarray(binary).save(tmp_path)
-        result3 = ocr.predict(tmp_path)
-        candidates.extend(self._extract_results(result3))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        cv_img = clahe.apply(cv_img)
+        _, cv_img = cv2.threshold(cv_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cv_img = cv2.morphologyEx(cv_img, cv2.MORPH_CLOSE, kernel)
+        run_strategy(cv_img, "clahe_otsu")
 
-        # 策略4: 自适应阈值
-        cv_img2 = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
-        cv_img2 = cv2.medianBlur(cv_img2, 3)
-        adaptive = cv2.adaptiveThreshold(cv_img2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY, 11, 2)
-        Image.fromarray(adaptive).save(tmp_path)
-        result4 = ocr.predict(tmp_path)
-        candidates.extend(self._extract_results(result4))
+        # 策略2: 原始图片
+        run_strategy(np.array(img.convert("RGB")), "raw")
 
-        if not candidates:
+        # 策略3: 固定阈值 127
+        cv_img3 = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        cv_img3 = cv2.medianBlur(cv_img3, 3)
+        _, cv_img3 = cv2.threshold(cv_img3, 127, 255, cv2.THRESH_BINARY)
+        cv_img3 = cv2.morphologyEx(cv_img3, cv2.MORPH_CLOSE, kernel)
+        run_strategy(cv_img3, "fixed127")
+
+        # 合并所有候选
+        all_candidates = combined + segments
+        if not all_candidates:
             return ""
 
-        # 优先在目标长度范围内选置信度最高的
-        best = None
-        for length in target_lens:
-            exact = [(t, s) for t, s in candidates if len(t) == length]
-            if exact:
-                best = max(exact, key=lambda x: x[1])
-                break
+        # 选出 4 位的
+        four = sorted([(t, s) for t, s in all_candidates if len(t) == 4],
+                      key=lambda x: -x[1])
+        if four:
+            log.info("OCR 4位: %s (置信度: %.4f)", four[0][0], four[0][1])
+            return four[0][0]
 
-        # 回退：选置信度最高的（不限制长度）
-        if best is None:
-            best = max(candidates, key=lambda x: x[1])
-
-        text = best[0]
-        log.info("OCR 候选: %s", [(t, f"{s:.2f}") for t, s in candidates])
-        log.info("OCR 最终: %s (置信度: %.4f)", text, best[1])
+        # 没 4 位就取最长的截断
+        best = max(all_candidates, key=lambda x: (len(x[0]), x[1]))
+        log.info("OCR 无4位候选: %s", [(t, f"{s:.2f}") for t, s in all_candidates])
+        text = best[0][:4]
+        log.info("OCR 截取: %s (来自 %s)", text, best[0])
         return text
-
-    @staticmethod
-    def _extract_results(result) -> list:
-        """从 PaddleOCR predict 结果中提取 (text, score) 列表"""
-        candidates = []
-        if result and isinstance(result, list) and len(result) > 0:
-            rec_texts = result[0].get("rec_texts", [])
-            rec_scores = result[0].get("rec_scores", [])
-            for text, score in zip(rec_texts, rec_scores):
-                clean = "".join(c for c in text if c.isalnum())
-                if clean and score >= 0.3:
-                    candidates.append((clean, score))
-        return candidates
 
     # --------------------------------------------------
     # 获取页面 & 下载验证码
