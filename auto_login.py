@@ -82,6 +82,11 @@ CONFIG = {
     "retry_delay": 1,
     "timeout": 30,
 
+    # -------- OCR 置信度阈值 --------
+    # 低于此值的4位结果不提交，刷新验证码重试
+    # 设为 0 则接受所有结果（最激进），设为 0.9 则只接受高置信度（最保守）
+    "min_confidence": 0.0,
+
     # -------- 登录成功判断 --------
     "success_keywords": ["登录成功", "欢迎", "dashboard", "退出"],
     "success_title_regex": r"成功",
@@ -173,15 +178,25 @@ class LoginBot:
         run_predict(filtered, "clean")
 
         # 筛选4位纯字母数字提交
+        min_conf = self.config.get("min_confidence", 0.0)
         good = []
+        low_conf = []
         for t, s, lbl in candidates:
             if len(t) == 4 and re.fullmatch(r"[A-Za-z0-9]{4}", t):
-                good.append((t.upper(), s, lbl))
+                if s >= min_conf:
+                    good.append((t.upper(), s, lbl))
+                else:
+                    low_conf.append((t.upper(), s, lbl))
 
         if good:
             best = max(good, key=lambda x: x[1])
             log.info("OCR 4位: %s (置信度: %.4f, 来源: %s)", best[0], best[1], best[2])
             return best[0]
+
+        if low_conf:
+            max_c = max(s for _, s in low_conf)
+            log.info("OCR 置信度不足(最高%.4f < %.2f)，刷新验证码重试", max_c, min_conf)
+            return ""
 
         log.info("OCR 未识别出有效4位结果，跳过本次")
         return ""
