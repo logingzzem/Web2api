@@ -78,7 +78,7 @@ CONFIG = {
     "extra_fields": {"keeplogin": "1"},
 
     # -------- 重试设置 --------
-    "max_retries": 30,
+    "max_retries": 15,
     "retry_delay": 1,
     "timeout": 30,
 
