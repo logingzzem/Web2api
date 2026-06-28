@@ -131,15 +131,17 @@ class LoginBot:
     # OCR 识别验证码
     # --------------------------------------------------
     def recognize_captcha(self, img: Image.Image) -> str:
-        """识别验证码，优先返回指定长度的结果"""
+        """识别验证码，尝试多种长度，优先选高置信度的"""
         import cv2
         import numpy as np
 
         cfg = self.config
-        target_len = cfg.get("captcha_length", 4)
         ocr = _get_ocr()
         tmp_path = "/tmp/_captcha.png"
         candidates = []
+
+        # 尝试的验证码长度（该网站可能返回 4~8 位）
+        target_lens = list(range(4, 9))
 
         # 策略1: 原始图片
         img.save(tmp_path)
@@ -172,14 +174,19 @@ class LoginBot:
         if not candidates:
             return ""
 
-        # 优先选目标长度的，否则选置信度最高的
-        exact_len = [(t, s) for t, s in candidates if len(t) == target_len]
-        if exact_len:
-            best = max(exact_len, key=lambda x: x[1])
-        else:
+        # 优先在目标长度范围内选置信度最高的
+        best = None
+        for length in target_lens:
+            exact = [(t, s) for t, s in candidates if len(t) == length]
+            if exact:
+                best = max(exact, key=lambda x: x[1])
+                break
+
+        # 回退：选置信度最高的（不限制长度）
+        if best is None:
             best = max(candidates, key=lambda x: x[1])
 
-        text = best[0][:target_len]
+        text = best[0]
         log.info("OCR 候选: %s", [(t, f"{s:.2f}") for t, s in candidates])
         log.info("OCR 最终: %s (置信度: %.4f)", text, best[1])
         return text
@@ -308,8 +315,8 @@ class LoginBot:
     # --------------------------------------------------
     # 主流程
     # --------------------------------------------------
-    def run(self) -> bool:
-        """执行完整登录流程，返回是否成功"""
+    def run(self, round_num: int = 1) -> tuple:
+        """执行完整登录流程，返回 (是否成功, 截图路径)"""
         cfg = self.config
 
         for attempt in range(1, cfg["max_retries"] + 1):
@@ -333,12 +340,15 @@ class LoginBot:
                     resp = self.submit_login(session, html, token, captcha_text)
                     resp_body = resp.body.decode("utf-8")
 
-                    # 4. 保存验证码截图（保留供查看）
-                    img.save("/workspace/captcha_screenshot.png")
+                    # 4. 保存验证码截图（保留供查看，文件名含轮次+时间戳）
+                    import time as _time
+                    ts = _time.strftime("%H%M%S")
+                    screenshot_path = f"/workspace/captcha_round{round_num}_{ts}.png"
+                    img.save(screenshot_path)
 
                     # 5. 检查结果
                     if self.check_success(resp_body):
-                        return True
+                        return True, screenshot_path
 
             except Exception as e:
                 log.error("异常: %s", e)
@@ -347,22 +357,23 @@ class LoginBot:
                 time.sleep(cfg.get("retry_delay", 1))
 
         log.error("已达最大重试次数，登录失败")
-        return False
+        return False, ""
 
 
 # ============================================================
 # 入口
 # ============================================================
 if __name__ == "__main__":
-    print("=" * 60)
-    print("      Scrapling + PaddleOCR 自动登录工具")
-    print("=" * 60)
-    print()
+    import sys
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 
-    bot = LoginBot(CONFIG)
-    success = bot.run()
-
-    if success:
-        print("\n✅ 登录成功!")
-    else:
-        print("\n❌ 登录失败，请检查配置或验证码识别能力")
+    for i in range(1, n + 1):
+        print("=" * 60)
+        print(f"  第 {i}/{n} 轮测试")
+        print("=" * 60)
+        bot = LoginBot(CONFIG)
+        success, screenshot_path = bot.run(round_num=i)
+        print(f"  结果: {'✅ 登录成功' if success else '❌ 登录失败'}")
+        if screenshot_path:
+            print(f"  验证码截图: {screenshot_path}")
+        print()
