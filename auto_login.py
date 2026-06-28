@@ -3,11 +3,11 @@
 支持图形验证码识别
 
 用法：
-    1. 修改下面的 CONFIG 配置（URL、用户名、密码、CSS选择器）
+    1. 修改下面的 CONFIG 配置
     2. python auto_login.py
 
 依赖：
-    pip install scrapling paddleocr
+    pip install scrapling paddleocr opencv-python-headless Pillow
 """
 
 import os
@@ -21,9 +21,12 @@ from urllib.parse import urljoin
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "1"
 
 from PIL import Image
-from scrapling import Fetcher
+from scrapling.fetchers import FetcherSession
 
-# PaddleOCR 懒加载（避免未使用时加载模型）
+import cv2
+import numpy as np
+
+# PaddleOCR 懒加载
 _ocr = None
 def _get_ocr():
     global _ocr
@@ -45,33 +48,48 @@ log = logging.getLogger(__name__)
 # ============================================================
 CONFIG = {
     # -------- 登录信息 --------
-    "url": "https://example.com/login",  # 登录页面 URL
-    "username": "your_username",
-    "password": "your_password",
+    "url": "https://scrm.asphel.cn/MredLNqPiT.php/index/login?name=mes",
+    "username": "mes",
+    "password": "123456",
 
-    # -------- 表单字段 CSS 选择器 --------
-    "username_selector": "#username",      # 用户名输入框
-    "password_selector": "#password",      # 密码输入框
-    "captcha_selector": "#captcha-img",    # 验证码图片 <img> 元素
-    "captcha_input_selector": "#captcha",  # 验证码输入框
-    "submit_selector": "#login-btn",       # 提交按钮
+    # -------- 表单字段的 name 属性 --------
+    # 如果不确定，留空让程序从页面自动检测
+    "field_username": "username",
+    "field_password": "password",
+    "field_captcha": "captcha",
+    "field_token": "__token__",           # CSRF Token 的 name
 
-    # -------- 验证码图片来源 --------
-    # "src"      – 从 <img> 的 src 属性获取 (默认)
-    # "base64"   – 从 <img> 的 src="data:image/..." 中提取
-    # "css_bg"   – 从元素的 background-image 中提取
-    "captcha_source": "src",
+    # -------- 验证码图片地址（CSS 选择器 / 固定 URL）-------
+    # 可以是:
+    #   - CSS 选择器字符串，如 "#captcha-img"
+    #   - 完整 URL 字符串
+    #   - 设为 None 则从 <img> 标签自动提取
+    "captcha_selector": None,
+    # 验证码图片 URL（如果有固定地址）
+    "captcha_url": "/index.php?s=/captcha",
+
+    # -------- 提交方式 --------
+    # form_action: None 表示提交到当前页面 URL
+    # form_selector: 表单的 CSS 选择器，用于提取 CSRF Token
+    "form_selector": "form",
+    "form_action": None,
+
+    # -------- 额外表单字段 --------
+    "extra_fields": {"keeplogin": "1"},
+
+    # -------- 验证码长度（用于筛选 OCR 结果）--------
+    "captcha_length": 4,
 
     # -------- 登录成功判断 --------
-    # 登录后页面如果包含以下任一文本，视为成功
-    "success_keywords": ["登录成功", "欢迎", "dashboard", "logout", "退出"],
-
-    # -------- Scrapling 设置 --------
-    "headless": True,
-    "timeout": 30,
+    # 1. 页面标题或 body 包含的关键词
+    "success_keywords": ["登录成功", "欢迎", "dashboard", "退出"],
+    # 2. 成功时页面标题（如果登录后跳转，标题会变化）
+    "success_title_regex": r"成功",
 
     # -------- 重试设置 --------
-    "max_retries": 3,
+    "max_retries": 10,
+    "retry_delay": 1,
+    "timeout": 30,
 }
 
 
@@ -80,203 +98,176 @@ class LoginBot:
 
     def __init__(self, config: dict):
         self.config = config
-        self.session = None
-        self.ocr = None
 
     # --------------------------------------------------
-    # 初始化
+    # 图片预处理
     # --------------------------------------------------
-    def init_session(self):
-        """初始化 Scrapling 会话"""
-        log.info("初始化 Scrapling 会话 ...")
-        Fetcher.configure(impersonate="chrome_120")
-        self.session = Fetcher()
-        log.info("会话已创建")
-
-    def init_ocr(self):
-        """初始化 PaddleOCR (只加载一次)"""
-        if self.ocr is None:
-            log.info("加载 PaddleOCR 模型（首次加载较慢）...")
-            self.ocr = _get_ocr()
-            log.info("PaddleOCR 就绪")
-        return self.ocr
-
-    # --------------------------------------------------
-    # 获取登录页面
-    # --------------------------------------------------
-    def fetch_login_page(self):
-        """获取登录页面 HTML"""
-        cfg = self.config
-        log.info("正在请求登录页面: %s", cfg["url"])
-        resp = self.session.get(cfg["url"], timeout=cfg["timeout"])
-        log.info("页面状态码: %s", resp.status)
-        if resp.status != 200:
-            raise RuntimeError(f"页面请求失败, 状态码: {resp.status}")
-        return resp
-
-    # --------------------------------------------------
-    # 提取验证码图片
-    # --------------------------------------------------
-    def extract_captcha_image(self, page) -> Image.Image | None:
-        """根据配置从页面提取验证码图片"""
-        cfg = self.config
-        img_el = page.css(cfg["captcha_selector"])
-        if not img_el:
-            log.warning("未找到验证码元素: %s", cfg["captcha_selector"])
-            return None
-
-        img_url = None
-        source = cfg.get("captcha_source", "src")
-
-        if source == "src":
-            img_url = img_el[0].attrib.get("src", "")
-        elif source == "base64":
-            src = img_el[0].attrib.get("src", "")
-            if src.startswith("data:image"):
-                img_url = src
-        elif source == "css_bg":
-            style = img_el[0].attrib.get("style", "")
-            m = re.search(r'url\(["\']?(.*?)["\']?\)', style)
-            if m:
-                img_url = m.group(1)
-
-        if not img_url:
-            log.warning("无法获取验证码图片 URL")
-            return None
-
-        log.info("验证码图片 URL: %s", img_url[:80])
-
-        # 处理 base64 内嵌图片
-        if img_url.startswith("data:image"):
-            import base64
-            b64_data = img_url.split(",", 1)[1]
-            raw = base64.b64decode(b64_data)
-            return Image.open(BytesIO(raw))
-
-        # 处理相对 URL
-        if not img_url.startswith("http"):
-            img_url = urljoin(self.config["url"], img_url)
-            log.info("拼接后 URL: %s", img_url)
-
-        # 通过 session 下载图片
-        img_resp = self.session.get(img_url, timeout=self.config["timeout"])
-        if img_resp.status != 200:
-            log.warning("验证码图片下载失败, 状态码: %s", img_resp.status)
-            return None
-        return Image.open(BytesIO(img_resp.body))
+    @staticmethod
+    def preprocess_captcha(img: Image.Image) -> Image.Image:
+        """对验证码图片进行预处理，提高 OCR 准确率"""
+        img = img.convert("RGB")
+        cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+        cv_img = cv2.GaussianBlur(cv_img, (3, 3), 0)
+        _, cv_img = cv2.threshold(cv_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return Image.fromarray(cv_img)
 
     # --------------------------------------------------
     # OCR 识别验证码
     # --------------------------------------------------
     def recognize_captcha(self, img: Image.Image) -> str:
-        """使用 PaddleOCR 识别验证码文字"""
-        if img is None:
+        """识别验证码，优先返回指定长度的结果"""
+        cfg = self.config
+        target_len = cfg.get("captcha_length", 4)
+
+        ocr = _get_ocr()
+        tmp_path = "/tmp/_captcha.png"
+
+        candidates = []
+
+        # 原始图片识别
+        img.save(tmp_path)
+        result = ocr.predict(tmp_path)
+        candidates.extend(self._extract_results(result))
+
+        # 预处理后识别
+        processed = self.preprocess_captcha(img)
+        processed.save(tmp_path)
+        result2 = ocr.predict(tmp_path)
+        candidates.extend(self._extract_results(result2))
+
+        if not candidates:
             return ""
 
-        ocr = self.init_ocr()
-        log.info("正在识别验证码 ...")
+        # 优先选目标长度的，否则选置信度最高的
+        exact_len = [(t, s) for t, s in candidates if len(t) == target_len]
+        if exact_len:
+            best = max(exact_len, key=lambda x: x[1])
+        else:
+            best = max(candidates, key=lambda x: x[1])
 
-        # 转为 RGB（RGBA → RGB）
-        if img.mode == "RGBA":
-            bg = Image.new("RGB", img.size, (255, 255, 255))
-            bg.paste(img, mask=img.split()[3])
-            img = bg
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
+        text = best[0][:target_len]
+        log.info("OCR 识别: %s (置信度: %.4f)", text, best[1])
+        return text
 
-        # 保存临时文件供 PaddleOCR 读取
-        tmp_path = "/tmp/_captcha.png"
-        img.save(tmp_path)
-
-        result = ocr.ocr(tmp_path)
-
-        text = ""
-        if result and result[0]:
-            texts = [line[1][0] for line in result[0]]
-            text = "".join(texts)
-            log.info("OCR 识别结果: %s (置信度: %.2f)",
-                      text, result[0][0][1][1] if result[0] else 0)
-
-        # 清理临时文件
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-        return text.strip()
+    @staticmethod
+    def _extract_results(result) -> list:
+        """从 PaddleOCR predict 结果中提取 (text, score) 列表"""
+        candidates = []
+        if result and isinstance(result, list) and len(result) > 0:
+            rec_texts = result[0].get("rec_texts", [])
+            rec_scores = result[0].get("rec_scores", [])
+            for text, score in zip(rec_texts, rec_scores):
+                clean = "".join(c for c in text if c.isalnum())
+                if clean and score >= 0.3:
+                    candidates.append((clean, score))
+        return candidates
 
     # --------------------------------------------------
-    # 填写并提交表单
+    # 获取页面 & 下载验证码
     # --------------------------------------------------
-    def submit_login(self, page, captcha_text: str):
-        """填写表单并提交"""
+    def fetch_page_and_captcha(self, session):
+        """获取登录页面 HTML，提取 CSRF Token，下载验证码图片"""
         cfg = self.config
+        url = cfg["url"]
+
+        # 获取页面
+        resp = session.get(url, timeout=cfg["timeout"])
+        html = resp.body.decode("utf-8")
+
+        # 提取 CSRF Token
+        token = ""
+        token_field = cfg.get("field_token", "__token__")
+        m = re.search(
+            rf'name="{re.escape(token_field)}"\s+value="([^"]*)"',
+            html,
+        )
+        if m:
+            token = m.group(1)
+
+        # 下载验证码图片
+        captcha_url = cfg.get("captcha_url")
+        if captcha_url:
+            if not captcha_url.startswith("http"):
+                captcha_url = urljoin(url, captcha_url)
+        else:
+            sel = cfg.get("captcha_selector")
+            if sel:
+                m = re.search(rf'<img[^>]+src="([^"]+)"', html)
+                captcha_url = m.group(1) if m else ""
+                if captcha_url and not captcha_url.startswith("http"):
+                    captcha_url = urljoin(url, captcha_url)
+
+        img = None
+        if captcha_url:
+            img_resp = session.get(captcha_url, timeout=cfg["timeout"])
+            if img_resp.status == 200 and len(img_resp.body) > 0:
+                img = Image.open(BytesIO(img_resp.body))
+
+        return html, token, img
+
+    # --------------------------------------------------
+    # 提交登录
+    # --------------------------------------------------
+    def submit_login(self, session, html: str, token: str, captcha_text: str):
+        """提交登录表单"""
+        cfg = self.config
+        url = cfg["url"]
+
         form_data = {}
 
-        # 获取已有表单字段
-        # 用户名
-        username_el = page.css(cfg["username_selector"])
-        username_name = username_el[0].attrib.get("name", "") if username_el else ""
-        if username_name:
-            form_data[username_name] = cfg["username"]
-        else:
-            log.warning("未找到用户名输入框: %s", cfg["username_selector"])
-            return None
+        # CSRF Token
+        if token:
+            form_data[cfg.get("field_token", "__token__")] = token
 
-        # 密码
-        password_el = page.css(cfg["password_selector"])
-        password_name = password_el[0].attrib.get("name", "") if password_el else ""
-        if password_name:
-            form_data[password_name] = cfg["password"]
+        # 用户名 / 密码 / 验证码
+        form_data[cfg.get("field_username", "username")] = cfg["username"]
+        form_data[cfg.get("field_password", "password")] = cfg["password"]
+        form_data[cfg.get("field_captcha", "captcha")] = captcha_text
 
-        # 验证码
-        captcha_el = page.css(cfg["captcha_input_selector"])
-        captcha_name = captcha_el[0].attrib.get("name", "") if captcha_el else ""
-        if captcha_name:
-            form_data[captcha_name] = captcha_text
-        else:
-            log.warning("未找到验证码输入框: %s", cfg["captcha_input_selector"])
-            return None
+        # 额外字段
+        form_data.update(cfg.get("extra_fields", {}))
 
-        log.info("表单数据(隐藏密码): %s", {
+        log.info("提交数据 (密码隐藏): %s", {
             k: ("******" if "pass" in k.lower() else v)
             for k, v in form_data.items()
         })
 
-        # 获取表单提交 URL（优先取表单 action）
-        form_el = page.css("form")
-        action = ""
-        if form_el:
-            action = form_el[0].attrib.get("action", "")
-
-        submit_url = urljoin(cfg["url"], action) if action else cfg["url"]
-        log.info("正在提交登录: %s", submit_url)
-
-        resp = self.session.post(submit_url, data=form_data, timeout=cfg["timeout"])
-        log.info("登录响应状态码: %s", resp.status)
+        # 提交
+        action = cfg.get("form_action")
+        submit_url = urljoin(url, action) if action else url
+        resp = session.post(submit_url, data=form_data, timeout=cfg["timeout"])
         return resp
 
     # --------------------------------------------------
     # 验证登录结果
     # --------------------------------------------------
-    def check_login_success(self, response) -> bool:
+    def check_success(self, resp_body: str) -> bool:
         """检查登录是否成功"""
-        body_text = response.text.lower()
-        for kw in self.config["success_keywords"]:
-            if kw.lower() in body_text:
+        cfg = self.config
+
+        # 检查成功关键词
+        body_lower = resp_body.lower()
+        for kw in cfg["success_keywords"]:
+            if kw.lower() in body_lower:
                 log.info("登录成功! (关键词: %s)", kw)
                 return True
 
-        # 检查是否有常见错误提示
-        error_keywords = ["验证码错误", "验证码不正确", "验证码已过期",
-                          "用户名或密码错误", "登录失败"]
-        for kw in error_keywords:
-            if kw.lower() in body_text:
-                log.warning("登录失败，页面包含: %s", kw)
+        # 检查标题
+        h1 = re.search(r"<h1[^>]*>(.*?)</h1>", resp_body, re.DOTALL)
+        title_regex = cfg.get("success_title_regex")
+        if title_regex and h1:
+            if re.search(title_regex, h1.group(1)):
+                log.info("登录成功! (标题匹配: %s)", h1.group(1).strip())
+                return True
+
+        # 检查是否还在登录页
+        login_indicators = ["验证码错误", "验证码不正确", "密码错误", "用户名不存在"]
+        for kw in login_indicators:
+            if kw in resp_body:
+                log.warning("登录失败: %s", kw)
                 return False
 
-        # 检查 URL 是否变化（登录成功通常会跳转）
-        log.warning("无法确定登录状态，请手动检查 response.text")
+        log.warning("无法确定登录状态")
         return False
 
     # --------------------------------------------------
@@ -285,58 +276,49 @@ class LoginBot:
     def run(self) -> bool:
         """执行完整登录流程，返回是否成功"""
         cfg = self.config
-        self.init_session()
 
         for attempt in range(1, cfg["max_retries"] + 1):
-            log.info("=" * 50)
-            log.info("第 %d/%d 次尝试", attempt, cfg["max_retries"])
-            log.info("=" * 50)
+            log.info("--- 第 %d/%d 次尝试 ---", attempt, cfg["max_retries"])
 
             try:
-                # 1. 获取登录页面
-                resp = self.fetch_login_page()
+                with FetcherSession() as session:
+                    # 1. 获取页面 + 下载验证码
+                    html, token, img = self.fetch_page_and_captcha(session)
+                    if img is None:
+                        log.warning("验证码下载失败")
+                        continue
 
-                # 2. 提取验证码图片
-                img = self.extract_captcha_image(resp)
-                if img is None:
-                    log.warning("无法获取验证码图片，重试 ...")
-                    continue
+                    # 2. 识别验证码
+                    captcha_text = self.recognize_captcha(img)
+                    if not captcha_text:
+                        log.warning("验证码识别为空")
+                        continue
 
-                # 3. 识别验证码
-                captcha_text = self.recognize_captcha(img)
-                if not captcha_text:
-                    log.warning("验证码识别结果为空，重试 ...")
-                    continue
+                    # 3. 提交登录
+                    resp = self.submit_login(session, html, token, captcha_text)
+                    resp_body = resp.body.decode("utf-8")
 
-                # 4. 提交登录
-                login_resp = self.submit_login(resp, captcha_text)
-                if login_resp is None:
-                    continue
-
-                # 5. 验证结果
-                if self.check_login_success(login_resp):
-                    return True
+                    # 4. 检查结果
+                    if self.check_success(resp_body):
+                        return True
 
             except Exception as e:
-                log.error("尝试失败: %s", e)
+                log.error("异常: %s", e)
 
             if attempt < cfg["max_retries"]:
-                log.info("等待 3 秒后重试 ...")
-                time.sleep(3)
+                time.sleep(cfg.get("retry_delay", 1))
 
         log.error("已达最大重试次数，登录失败")
         return False
 
 
 # ============================================================
-# 简易入口
+# 入口
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
     print("      Scrapling + PaddleOCR 自动登录工具")
     print("=" * 60)
-    print()
-    print("使用前请修改脚本顶部 CONFIG 配置")
     print()
 
     bot = LoginBot(CONFIG)
@@ -345,4 +327,4 @@ if __name__ == "__main__":
     if success:
         print("\n✅ 登录成功!")
     else:
-        print("\n❌ 登录失败，请检查配置或验证码识别")
+        print("\n❌ 登录失败，请检查配置或验证码识别能力")

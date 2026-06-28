@@ -10,4 +10,5 @@ if [ ! -f "$PYTHON" ]; then
     exit 1
 fi
 
+export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1
 exec "$PYTHON" /workspace/auto_login.py "$@"
