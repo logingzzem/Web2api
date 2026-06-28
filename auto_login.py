@@ -87,7 +87,7 @@ CONFIG = {
     "success_title_regex": r"成功",
 
     # -------- 重试设置 --------
-    "max_retries": 10,
+    "max_retries": 20,
     "retry_delay": 1,
     "timeout": 30,
 }
@@ -105,10 +105,26 @@ class LoginBot:
     @staticmethod
     def preprocess_captcha(img: Image.Image) -> Image.Image:
         """对验证码图片进行预处理，提高 OCR 准确率"""
+        import cv2
+        import numpy as np
+
         img = img.convert("RGB")
         cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-        cv_img = cv2.GaussianBlur(cv_img, (3, 3), 0)
+
+        # 中值滤波去除椒盐噪点
+        cv_img = cv2.medianBlur(cv_img, 3)
+
+        # 对比度增强
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        cv_img = clahe.apply(cv_img)
+
+        # 二值化（OTSU 自动阈值）
         _, cv_img = cv2.threshold(cv_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # 形态学操作：去除细小干扰线
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        cv_img = cv2.morphologyEx(cv_img, cv2.MORPH_CLOSE, kernel)
+
         return Image.fromarray(cv_img)
 
     # --------------------------------------------------
@@ -116,24 +132,42 @@ class LoginBot:
     # --------------------------------------------------
     def recognize_captcha(self, img: Image.Image) -> str:
         """识别验证码，优先返回指定长度的结果"""
+        import cv2
+        import numpy as np
+
         cfg = self.config
         target_len = cfg.get("captcha_length", 4)
-
         ocr = _get_ocr()
         tmp_path = "/tmp/_captcha.png"
-
         candidates = []
 
-        # 原始图片识别
+        # 策略1: 原始图片
         img.save(tmp_path)
         result = ocr.predict(tmp_path)
         candidates.extend(self._extract_results(result))
 
-        # 预处理后识别
+        # 策略2: 中值滤波 + CLAHE + OTSU 二值化
         processed = self.preprocess_captcha(img)
         processed.save(tmp_path)
         result2 = ocr.predict(tmp_path)
         candidates.extend(self._extract_results(result2))
+
+        # 策略3: 高对比度二值化（固定阈值 127）
+        cv_img = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        cv_img = cv2.medianBlur(cv_img, 3)
+        _, binary = cv2.threshold(cv_img, 127, 255, cv2.THRESH_BINARY)
+        Image.fromarray(binary).save(tmp_path)
+        result3 = ocr.predict(tmp_path)
+        candidates.extend(self._extract_results(result3))
+
+        # 策略4: 自适应阈值
+        cv_img2 = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        cv_img2 = cv2.medianBlur(cv_img2, 3)
+        adaptive = cv2.adaptiveThreshold(cv_img2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY, 11, 2)
+        Image.fromarray(adaptive).save(tmp_path)
+        result4 = ocr.predict(tmp_path)
+        candidates.extend(self._extract_results(result4))
 
         if not candidates:
             return ""
@@ -146,7 +180,8 @@ class LoginBot:
             best = max(candidates, key=lambda x: x[1])
 
         text = best[0][:target_len]
-        log.info("OCR 识别: %s (置信度: %.4f)", text, best[1])
+        log.info("OCR 候选: %s", [(t, f"{s:.2f}") for t, s in candidates])
+        log.info("OCR 最终: %s (置信度: %.4f)", text, best[1])
         return text
 
     @staticmethod
@@ -298,7 +333,10 @@ class LoginBot:
                     resp = self.submit_login(session, html, token, captcha_text)
                     resp_body = resp.body.decode("utf-8")
 
-                    # 4. 检查结果
+                    # 4. 保存验证码截图（保留供查看）
+                    img.save("/workspace/captcha_screenshot.png")
+
+                    # 5. 检查结果
                     if self.check_success(resp_body):
                         return True
 
