@@ -158,7 +158,15 @@ class LoginBot:
         # 策略1: 原始图
         run_predict(rgb, "raw")
 
-        # 策略2: CLAHE + OTSU + 连通区域去噪
+        # 策略2: HSV饱和度通道（字符单一颜色→饱和度突出）
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        sat = hsv[:, :, 1]  # 饱和度通道：彩色字符亮，背景噪点暗
+        sat = cv2.medianBlur(sat, 3)
+        _, sat_bin = cv2.threshold(sat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        sat_bin = cv2.morphologyEx(sat_bin, cv2.MORPH_CLOSE, kernel)
+        run_predict(sat_bin, "hsv")
+
+        # 策略3: CLAHE + OTSU + 连通区域去噪
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         gray = cv2.medianBlur(gray, 3)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
