@@ -78,7 +78,7 @@ CONFIG = {
     "extra_fields": {"keeplogin": "1"},
 
     # -------- 重试设置 --------
-    "max_retries": 15,
+    "max_retries": 30,
     "retry_delay": 1,
     "timeout": 30,
 
@@ -172,7 +172,7 @@ class LoginBot:
                 filtered[labels == i] = 255
         run_predict(filtered, "clean")
 
-        # 筛选4位纯字母数字
+        # 筛选4位纯字母数字提交
         good = []
         for t, s, lbl in candidates:
             if len(t) == 4 and re.fullmatch(r"[A-Za-z0-9]{4}", t):
@@ -183,7 +183,6 @@ class LoginBot:
             log.info("OCR 4位: %s (置信度: %.4f, 来源: %s)", best[0], best[1], best[2])
             return best[0]
 
-        # 降级截取已禁用：历史数据表明截取结果几乎全部错误
         log.info("OCR 未识别出有效4位结果，跳过本次")
         return ""
 
